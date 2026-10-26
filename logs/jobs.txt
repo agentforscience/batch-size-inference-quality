@@ -1,0 +1,7 @@
+q05   Qwen/Qwen2.5-0.5B-Instruct   3.6  bfloat16  X=0
+q15   Qwen/Qwen2.5-1.5B-Instruct   4.6  bfloat16  X=0
+l1b   unsloth/Llama-3.2-1B-Instruct 4.6 bfloat16  X=0
+q05f32 Qwen/Qwen2.5-0.5B-Instruct  5.0  float32   X=0
+q3    Qwen/Qwen2.5-3B-Instruct     8.5  bfloat16  X=0
+l3b   unsloth/Llama-3.2-3B-Instruct 8.8 bfloat16  X=0
+q7    Qwen/Qwen2.5-7B-Instruct     19   bfloat16  B1_SUB=1

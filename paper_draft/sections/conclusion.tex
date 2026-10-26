@@ -1,0 +1,8 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+We asked whether the batch a prompt is processed in changes its greedy output. In a standard bf16 \vllm deployment, it does: changing batch size or batch-mates changes the exact output of 20--34\% of prompts and 47--76\% of CoT generations, while identical schedules reproduce outputs exactly. Every divergence begins at a near-tied logit, where batch-dependent rounding flips the argmax, and the continuation then drifts freely. Output length, not task type, determines how exposed a prompt is, and numeric precision matters far more than model size between 0.5B and 3B. Mean accuracy is robust to batching, but 3--5\% of items, and up to 16\% of CoT multiple-choice items, flip correctness.
+
+The key takeaway is that \emph{greedy decoding in bf16 is deterministic only given the batch schedule}. Evaluations should treat a single run as one sample, and item-level reproducibility requires a fixed schedule, batch-invariant kernels, or higher precision.
+
+Future work should test models of 7B--70B parameters and Hopper GPUs, use \vllm's batch-invariant mode as a positive control, test whether computing only the final projection (\texttt{lm\_head}) in fp32 removes most ties, simulate continuous batching under realistic arrival processes, and study reasoning models with 4k--32k-token traces, where our length results predict near-certain divergence.

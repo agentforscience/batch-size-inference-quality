@@ -1,0 +1,8 @@
+{
+ "model": "Qwen/Qwen2.5-3B-Instruct-AWQ",
+ "tag": "q3awq",
+ "dtype": "auto",
+ "mem_gb": 4.4,
+ "gpu": "1",
+ "max_num_seqs": 64
+}

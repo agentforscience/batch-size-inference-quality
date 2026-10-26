@@ -1,0 +1,17 @@
+\section{Divergence Examples}
+\label{app:examples}
+
+We show further $B=1$ vs $B=64$ pairs. In each case the first differing token has a $B=1$ margin of 0.125 nats (one bf16 step) or 0 (exact tie). Outputs are truncated with ``\ldots''.
+
+\para{\llama-1B, \gsm (gold 9; margin 0.125 at token 26).} Both runs start ``To find the minimum number of points Jane must score on the third test, we need to first find the total points she needs to\ldots''. The $B=1$ run continues ``\ldots score on all three tests to pass'', correctly computes $42-33=9$, but then adds 18 and answers 27 (wrong). The $B=64$ run continues ``\ldots pass'', sets up $15+18+x=42$ and answers 9 (correct).
+
+\para{\llama-1B, \agnews (gold World; margin 0 at token 0).} The $B=1$ run outputs ``World'' and the $B=64$ run outputs ``Business''. The two labels are exactly tied in bf16 at the first token, so the prefill pass alone decides the label.
+
+\para{\qwen-3B, \mmlucot (gold C; margin 0 at token 6).} Both runs begin ``The woman's purported acceptance was\ldots''. The $B=1$ run continues ``in the form of a fax'', reasons for 177 tokens and answers C (correct). The $B=64$ run continues ``oral'', concludes after 42 tokens that the statute of frauds applies, and answers B (wrong).
+
+\para{\qwen-3B, \gsm (gold 2; margin 0 at token 49).} Both runs compute 8 test tubes. At token 49 the $B=1$ run writes ``Next, we know Igor gathered 2 more beakers'' and the $B=64$ run writes ``Next, let's find out how many Petri dishes''. The $B=1$ run goes on to solve for the wrong quantity, while the $B=64$ run reaches the correct answer, 2.
+
+\section{Reproducibility Details}
+\label{app:repro}
+
+Prompts are stored in \texttt{datasets/processed/items.jsonl}. Raw generations, including token ids and per-token top-2 log-probabilities, are stored per model and condition in \texttt{results/gen/<model>/<cond>.jsonl}, with timings in \texttt{timing.jsonl}. Order A uses seed 0, order B (for \bshuf) uses seed 1, the item sample uses seed 42, and the engine seed is 1234. The 340-item subset consists of every 5th item in order A. The Holm family contains the 28 tests of model $\times$ $B\in\{4,16,64\}$ against $B=1$ (24 for the eight configurations with \cond{b4}, plus 4 for the two 3B bf16 models without it). The per-token hazard divides the number of diverging items by the number of tokens at risk, summed over items: for a diverging pair, the tokens up to and including the first divergence; for an identical pair, the full output length.

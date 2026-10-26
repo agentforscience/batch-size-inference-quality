@@ -1,0 +1,18 @@
+{
+  "success": true,
+  "stages": {
+    "resource_finder": {
+      "success": true,
+      "skipped": true
+    },
+    "experiment_runner": {
+      "success": true,
+      "return_code": 0,
+      "elapsed_time": 16502.813495397568,
+      "log_file": "/data/summereunann/neurico-workspaces/batch_size_inference_quality_20261023_120002_gh34ij56/logs/execution_claude.log",
+      "transcript_file": "/data/summereunann/neurico-workspaces/batch_size_inference_quality_20261023_120002_gh34ij56/logs/execution_claude_transcript.jsonl",
+      "background_processes_terminated": false
+    }
+  },
+  "work_dir": "/data/summereunann/neurico-workspaces/batch_size_inference_quality_20261023_120002_gh34ij56"
+}

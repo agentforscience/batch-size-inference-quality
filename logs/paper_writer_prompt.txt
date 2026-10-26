@@ -1,0 +1,707 @@
+You are an academic paper writer. Generate a complete NEURIPS style paper
+based on the experiment results provided.
+
+════════════════════════════════════════════════════════════════════════════════
+                         IMPORTANT: BEFORE YOU START
+════════════════════════════════════════════════════════════════════════════════
+
+Before writing any content, you MUST complete these steps:
+
+1. READ THE SKILL: Review the paper-writer skill at .claude/skills/paper-writer/SKILL.md
+2. READ THE STYLE GUIDE: Study templates/paper_writing/lab_style_guide.md carefully
+3. REVIEW EXAMPLES: Browse paper_examples/ for formatting and language patterns:
+   - Look at sections/1.introduction.tex for language style
+   - Look at tables/*.tex for table formatting
+   - Look at commands/*.tex for macro usage
+4. VERIFY COMMAND TEMPLATES: Command templates (math.tex, general.tex, macros.tex) are pre-copied to paper_draft/commands/
+
+CRITICAL: Reference example papers for FORMATTING and LANGUAGE STYLE only.
+Do NOT copy content, phrasing, or narrative structure from the example papers.
+The examples are in a different research domain - focus only on presentation style.
+
+════════════════════════════════════════════════════════════════════════════════
+                            EXPERIMENT REPORT
+════════════════════════════════════════════════════════════════════════════════
+
+# Batch Size Effects on LLM Inference Quality: Does Batching Change Greedy Outputs?
+
+## 1. Executive Summary
+
+**Question.** With greedy (temperature 0) decoding, does the batch a prompt is processed in change the
+model's output? If so, how often, where in the sequence, for which tasks and model sizes, and with
+what effect on accuracy?
+
+**Answer.** Yes, and much more often than the hypothesis predicted. We used vLLM 0.32 on byte-identical
+prompts and 10 model configurations (5 bf16 models from 0.5B to 3B in two families, plus fp16, fp32
+and AWQ variants), with 1,700 prompts each. Moving from sequential decoding (B=1) to any batched
+setting (B=4, 16 or 64) changed the exact output of **20–34% of all prompts** for bf16 models,
+against the hypothesised 3–5%. For long chain-of-thought (CoT) outputs the figure was **47–76%**.
+For short label outputs it was 1–4%. Batch *size* is not the real variable. Keeping B=64 and only
+reshuffling which prompts share a batch caused almost as much divergence (40–73% of CoT outputs).
+Re-running an identical schedule caused **zero** divergence in all 10 configurations: the engine is
+deterministic given the batch, and the only source of variation is which batch a prompt lands in.
+
+**Mechanism.** Every first-divergence token in the bf16 runs was a near-tie. About 45% were *exact*
+ties of the top-2 bf16 log-probabilities in the B=1 run, and ≥91% were within one bf16 rounding step
+(≤0.125 nats). Only ~1% of all tokens are exact ties, so divergence is ~40× enriched at ties.
+Raising numeric precision cuts divergence monotonically on the same Qwen2.5-0.5B weights: bf16 33.5%,
+fp16 7.3%, fp32 2.8% of prompts (B=1 vs B=64).
+
+**Practical implications.** Mean accuracy barely moves. Batched minus sequential accuracy was within
+±1.8 pp everywhere, and no difference survived Holm correction. Still, 3–5% of all items, and up to
+16% of MMLU-CoT items, flip between correct and incorrect. Single-run bf16 evaluations therefore
+carry a hidden ±1 pp "batching noise", and per-item results (regression tests, cached answers,
+LLM-as-judge pipelines) are not reproducible across serving configurations unless the batch
+schedule or the kernels are fixed.
+
+## 2. Research Question & Hypothesis
+
+The hypothesis under test, split into components:
+
+| ID | Claim | Verdict |
+|---|---|---|
+| H1 | >95% of prompts give identical greedy outputs across batch sizes; only 3–5% diverge | **Refuted** for bf16 (66–80% identical overall, 24–53% on CoT). Holds only for fp32 (97%) and roughly for fp16 or AWQ (92–97%) |
+| H1b | The cause is floating-point non-determinism in batched kernels | **Supported**, with a refinement: it is deterministic but batch-*dependent* rounding, and it acts only at near-tied logits |
+| H2 | Divergence increases with sequence length | **Supported** (logit coefficient on log length = 1.14, p≈1e-78) |
+| H3 | Math/reasoning diverges more than classification | **Refuted as stated.** The gap is fully explained by output length: task kind is n.s. once length is controlled (p=0.58), and per-token divergence hazard is *not* lower for classification. Among CoT tasks, GSM8K math diverges *less* than MMLU-CoT (odds ratio 0.41, p≈5e-31) |
+| H4 | Mean accuracy differs by <1 pp, but individual samples flip | **Supported.** Mean \|Δ\| over bf16 models (B=1 vs B=64) = 0.8 pp, none significant; 2.9–5.3% of items flip |
+| H5 | Smaller models diverge more | **Not supported.** No monotone trend (Spearman ρ=−0.05, p=0.93, 5 bf16 models). Qwen2.5-3B diverges as much as 0.5B. Precision matters far more than size |
+
+## 3. Background (brief literature context)
+
+No pre-gathered literature, datasets or code were present in this workspace (the resource-finder
+stage produced nothing), so this context comes from background knowledge:
+- **Thinking Machines Lab, "Defeating Nondeterminism in LLM Inference" (He et al., 2025).** Argues
+  that LLM inference non-determinism comes mainly from a lack of *batch invariance*: matmul, RMSNorm
+  and attention kernels pick different reduction strategies or tilings depending on batch size, so
+  one request's numerics depend on its co-scheduled requests. Atomics-based run-to-run nondeterminism
+  is not the main cause. They provide batch-invariant kernels for vLLM.
+- **Yuan et al. (2025), "Give Me FP32 or Give Me Death? Challenges and Solutions for Reproducible
+  Reasoning".** Report that GPU count, batch size and dtype change greedy outputs and accuracy of
+  reasoning models, and that higher precision (fp32) largely restores reproducibility.
+- **Atil et al. (2024), "LLM Stability: A detailed analysis with some surprises".** Shows that
+  "deterministic" API settings still give varying outputs.
+
+Our study adds a controlled per-prompt decomposition on open models: (i) batch size versus batch
+composition versus run-to-run repeat; (ii) task type versus output length; (iii) a token-level
+mechanism (margin at the divergence point); (iv) a precision ladder on fixed weights; (v) model size
+within a fixed dtype.
+
+## 4. Methodology
+
+### 4.1 Models (all local, via vLLM; no API models, because the question concerns the inference engine itself)
+
+| Tag | Model | Weights / activation dtype |
+|---|---|---|
+| q05, q15, q3 | Qwen/Qwen2.5-{0.5B,1.5B,3B}-Instruct | bf16 |
+| l1b, l3b | Llama-3.2-{1B,3B}-Instruct (unsloth mirror) | bf16 |
+| q05f16 | Qwen2.5-0.5B-Instruct | fp16 (same weights, cast) |
+| q05f32 | Qwen2.5-0.5B-Instruct | fp32 (same weights, cast) |
+| q05awq, q15awq, q3awq | Qwen/Qwen2.5-{0.5B,1.5B,3B}-Instruct-AWQ | int4 weights, fp16 activations |
+
+The planned Qwen2.5-7B bf16 run needs a ≥19 GB GPU slice, and it never got one on the shared GPUs
+during the session (see §6).
+
+### 4.2 Data (1,700 items; `datasets/processed/items.jsonl`, seed 42)
+
+| Task | Source | n | Output type | max_tokens |
+|---|---|---|---|---|
+| gsm8k | openai/gsm8k test | 400 | CoT + "The answer is N" | 512 |
+| mmlu_cot | cais/mmlu test | 300 | CoT + "The answer is X" | 512 |
+| mmlu_direct | cais/mmlu test (disjoint questions) | 400 | letter only | 8 |
+| agnews | fancyzhx/ag_news test | 300 | topic label | 8 |
+| sst2 | stanfordnlp/sst2 validation | 300 | positive/negative | 8 |
+
+MMLU appears both with CoT (long) and as a direct letter answer (short). This lets us separate
+*task* from *output length*. Prompts are chat-templated with a task-specific system prompt (see
+`src/generate.py`, `SYSTEM`).
+
+### 4.3 Conditions (one vLLM engine per model, all conditions run in the same engine)
+
+Prompts are put in a fixed, task-mixed random order (seed 0), then submitted as static chunks of B
+(`llm.generate(chunk)`), so exactly ≤B sequences are co-scheduled.
+
+| Condition | B | Order | Purpose |
+|---|---|---|---|
+| b1 | 1 | A | sequential reference |
+| b4, b16, b64 | 4/16/64 | A | batch-size sweep |
+| b64_rep | 64 | A | identical schedule again: run-to-run noise floor |
+| b64_shuf | 64 | B (seed 1) | same B, different batch-mates |
+| b1_rep | 1 | A, every 5th item (n=340) | determinism of the reference |
+
+Engine settings: vLLM 0.32.0 (V1 engine, in-process), `enforce_eager=True`, chunked prefill
+(`max_num_batched_tokens=1024`), `max_num_seqs=64`, **prefix caching disabled**, `max_model_len=2048`,
+`temperature=0`, `logprobs=2` (top-2 log-probs recorded for every generated token), seed 1234.
+For the 3B bf16 models, time limits on the shared GPUs forced two changes: b1 and b1_rep ran on the
+340-item subset (every 5th item), and b4 was dropped.
+
+### 4.4 Metrics and statistics
+- **Divergence** = generated token-id sequences not identical. Also recorded: first divergence index
+  and whether the extracted answer changed.
+- **Margin at divergence** = top-1 minus top-2 log-prob in the *reference* run at the first
+  differing position.
+- **Accuracy** by rule-based answer extraction (`src/analyze.py: extract`). Paired comparison:
+  exact McNemar (binomial) test, Holm-corrected over the 28 primary (model × B∈{4,16,64} vs B=1)
+  tests, plus a 2,000-sample paired bootstrap 95% CI on Δaccuracy.
+- Wilson 95% CIs for divergence proportions. Logistic regression `div ~ log(len) + task + model` for
+  H2/H3. Per-token hazard = divergences per 1,000 identical tokens at risk. Spearman ρ for model size
+  (H5).
+
+### 4.5 Hardware / reproducibility
+4× RTX A6000 (48 GB), heavily shared with other users. Each job ran in a 3.4–8.8 GB slice. Python
+3.12.12, vLLM 0.32.0, torch 2.13.0+cu130, transformers 5.19, driver 595.58. Total generation was
+~19 GPU-hours of wall time across 10 configurations (~10.5k generations each); see
+`results/gen/*/timing.jsonl`. Raw outputs, including token ids and per-token margins, are in
+`results/gen/<model>/<cond>.jsonl`.
+
+## 5. Results
+
+### 5.1 How often do outputs change? (H1)
+
+Percentage of prompts whose greedy output is **not** token-identical (Wilson 95% CIs in
+`results/summary_divergence_kind.csv`). Long = gsm8k + mmlu_cot (n=700); short = 3 label tasks
+(n=1000); 3B bf16 b1 comparisons use the 140/200-item subsets.
+
+| Model | dtype | B1 vs B4 long / short | B1 vs B16 long / short | **B1 vs B64 long / short** | **B64 vs B64-shuffled** long / short | B64 vs B64 repeat | B1 vs B1 repeat |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | bf16 | 75.9 / 3.6 | 75.0 / 3.7 | **76.4 / 3.4** | 72.7 / 1.3 | 0 / 0 | 0 / 0 |
+| Qwen2.5-1.5B | bf16 | 45.1 / 1.9 | 44.0 / 1.1 | **46.9 / 1.1** | 40.0 / 0.3 | 0 / 0 | 0 / 0 |
+| Qwen2.5-3B | bf16 | – | 65.7 / 2.5 | **76.4 / 3.0** | 63.7 / 0.0 | 0 / 0 | – |
+| Llama-3.2-1B | bf16 | 50.1 / 2.3 | 50.1 / 4.3 | **51.7 / 4.1** | 45.3 / 0.4 | 0 / 0 | 0 / 0 |
+| Llama-3.2-3B | bf16 | – | 57.1 / 1.0 | **54.3 / 1.5** | 47.0 / 0.4 | 0 / 0 | 0 / 0 |
+| Qwen2.5-0.5B | fp16 | 17.9 / 0.5 | 20.7 / 0.4 | **17.3 / 0.3** | 16.1 / 0.0 | 0 / 0 | 0 / 0 |
+| Qwen2.5-0.5B | **fp32** | 6.1 / 0.3 | 7.4 / 0.3 | **6.3 / 0.4** | 4.9 / 0.0 | 0 / 0 | 0 / 0 |
+| Qwen2.5-0.5B | AWQ | 18.4 / 0.4 | 18.0 / 0.3 | **20.1 / 0.2** | 19.9 / 0.4 | 0 / 0 | – |
+| Qwen2.5-1.5B | AWQ | 7.9 / 0.2 | 6.0 / 0.1 | **7.4 / 0.3** | 8.7 / 0.1 | 0 / 0 | 0 / 0 |
+| Qwen2.5-3B | AWQ | 15.0 / 0.0 | 14.4 / 0.0 | **13.6 / 0.0** | 13.9 / 0.0 | 0 / 0 | 0 / 0 |
+
+Pooled over all 1,700 prompts (B=1 vs B=64), the share of prompts with a different output was:
+Qwen-0.5B 33.5% [31.3, 35.7], Qwen-1.5B 19.9%, Qwen-3B 33.2% (n=340), Llama-1B 23.7%, Llama-3B
+23.2% (n=340), fp16 7.3%, fp32 2.8% [2.1, 3.7], AWQ 3.2–8.4%. The *extracted answer* changed for
+5–12.5% of prompts (bf16) and 0.5–3.4% (other dtypes).
+
+![divergence vs batch](figures/divergence_vs_batch.png)
+
+Key observations:
+1. **No dose-response in B.** B=4 already gives the full effect, and B=64 adds nothing. What matters
+   is *whether* the numerics change, not by how much the batch grows.
+2. **Batch composition is as important as batch size.** Reshuffling batch-mates at fixed B=64 gives
+   83–100% of the B1-vs-B64 divergence.
+3. **The engine is perfectly deterministic for a fixed schedule.** All 18 repeat comparisons (10 × b64_rep,
+   8 × b1_rep) showed 0 divergent prompts out of 19,720. The variation is batch-*dependence*, not
+   randomness.
+
+### 5.2 Where do divergences start? Mechanism (H1b)
+
+![margin at divergence](figures/margin_at_divergence.png)
+
+| Model | % of all B=1 tokens that are exact top-2 ties | % of first-divergence tokens that are exact ties | % of divergences with margin ≤0.125 | median margin at divergence |
+|---|---|---|---|---|
+| Qwen2.5-0.5B bf16 | 1.02 | 43.2 | 93.9 | 0.125 |
+| Qwen2.5-1.5B bf16 | 0.93 | 46.9 | 96.2 | 0.125 |
+| Qwen2.5-3B bf16 | 1.38 | 43.4 | 91.2 | 0.125 |
+| Llama-3.2-1B bf16 | 1.55 | 45.2 | 97.8 | 0.125 |
+| Llama-3.2-3B bf16 | 1.52 | 46.8 | 100 | 0.125 |
+| Qwen2.5-0.5B fp16 | 0.14 | 46.8 | 100 | 0.016 |
+| Qwen2.5-0.5B fp32 | 0.00 | 0 | 100 | 0.0014 |
+| Qwen2.5 AWQ (0.5/1.5/3B) | 0.12–0.14 | 45–60 | 100 | 0.000–0.016 |
+
+In bf16, logits are stored with an 8-bit mantissa, so log-probs near the top come in steps of 0.0625
+to 0.125 nats. About 1% of all tokens are exact ties, and about 3–5% are within one step. The
+batch-dependent reduction order perturbs the logits by roughly one rounding step, which is enough to
+flip the argmax *only* at these near-ties. Margins at divergence never exceeded 0.375 nats; for
+fp16/fp32 they never exceeded 0.047 nats. Precision ladder on identical Qwen2.5-0.5B weights
+(prompts diverging, B1 vs B64): **bf16 33.5% → fp16 7.3% → fp32 2.8%**. AWQ models compute in fp16
+and sit at the fp16 level (3–8%), i.e. well below their bf16 counterparts. Activation precision, not
+quantisation, is the dominant factor.
+
+Once two runs diverge at one near-tie, the continuations differ and are not "re-synchronised". The
+median first divergence comes ~45–57 tokens into a CoT for bf16 (~60–110 for fp16/fp32/AWQ), at ~20–40% of
+the output length. For bf16 short-label tasks 44–100% of divergences hit the very first generated token,
+which is decided by the prefill pass.
+
+### 5.3 Length versus task type (H2, H3)
+
+![survival](figures/survival_identical_prefix.png)
+![divergence vs length](figures/divergence_vs_length.png)
+
+- **Length (H2).** Divergence rises steeply with output length. For bf16 models it goes from 6–56%
+  for ~50-token CoTs to 77–90% for >400-token CoTs (bins with ≥10 items). In logistic regression on CoT items (B1 vs B64,
+  all models) the log(length) coefficient is +1.14 (p≈1e-78). Across all tasks it is +0.95
+  (p≈3e-67).
+- **Task (H3).** Classification looks much more stable (1–4% vs 47–76%), but that is because its
+  outputs are 1–3 tokens long. With log length in the model, *short-label vs CoT* has coefficient
+  −0.14, p=0.58 (n.s.). The per-token hazard (divergences per 1,000 tokens at risk, B1 vs B64) is
+  *not* lower for label tasks. For bf16 models it is 3.7–5.8 for GSM8K, 5.7–12.9 for MMLU-CoT,
+  5.8–36.6 for MMLU-direct, and 0–31 for AG News/SST-2 (`results/summary_hazard.csv`). Uncertain
+  multiple-choice first tokens are especially tie-prone. Within CoT tasks, **math (GSM8K) diverges
+  less than MMLU-CoT** at equal length (odds ratio 0.41, p≈5e-31). One plausible reading: arithmetic
+  steps are more peaked (fewer near-ties) than free-text explanations of answer options.
+
+### 5.4 Accuracy impact (H4)
+
+![accuracy delta](figures/accuracy_delta.png)
+
+| Model | Acc B=1 | Acc B=64 | Δ (pp) [95% CI] | items flipped (R→W / W→R) | flip % | McNemar p (Holm) |
+|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B bf16 | 56.18 | 56.88 | +0.71 [−0.41, +1.76] | 39 / 51 | 5.3 | 0.25 (1.0) |
+| Qwen2.5-1.5B bf16 | 70.88 | 70.59 | −0.29 [−1.06, +0.59] | 29 / 24 | 3.1 | 0.58 (1.0) |
+| Qwen2.5-3B bf16 (n=340) | 72.94 | 71.76 | −1.18 [−2.94, +0.59] | 7 / 3 | 2.9 | 0.34 (1.0) |
+| Llama-3.2-1B bf16 | 50.12 | 49.94 | −0.18 [−1.12, +0.76] | 35 / 32 | 3.9 | 0.81 (1.0) |
+| Llama-3.2-3B bf16 (n=340) | 67.65 | 69.41 | +1.76 [−0.29, +4.12] | 4 / 10 | 4.1 | 0.18 (1.0) |
+| Qwen2.5-0.5B fp16 | 56.82 | 56.82 | 0.00 [−0.41, +0.47] | 7 / 7 | 0.8 | 1.0 (1.0) |
+| Qwen2.5-0.5B fp32 | 56.35 | 56.12 | −0.24 [−0.65, +0.18] | 8 / 4 | 0.7 | 0.39 (1.0) |
+| Qwen2.5-0.5B AWQ | 45.00 | 45.24 | +0.24 [−0.18, +0.65] | 4 / 8 | 0.7 | 0.39 (1.0) |
+| Qwen2.5-1.5B AWQ | 67.47 | 67.35 | −0.12 [−0.47, +0.18] | 5 / 3 | 0.5 | 0.73 (1.0) |
+| Qwen2.5-3B AWQ | 74.53 | 74.59 | +0.06 [−0.18, +0.29] | 2 / 3 | 0.3 | 1.0 (1.0) |
+
+Accuracy is micro-averaged over all 1,700 items (the 340-item subset for 3B bf16). None of the 28
+primary B-vs-B1 tests is significant after Holm correction. The smallest raw p was 0.002 (fp16,
+B1 vs B4, −0.76 pp), giving 0.066 adjusted. Flips are symmetric (right→wrong ≈ wrong→right): batching
+does not systematically help or hurt; it re-rolls the outcome of borderline items. Mean |Δ| across
+bf16 models is 0.8 pp, but single comparisons reach 1–1.8 pp, and **per task** the flip rate is much
+higher. Among MMLU-CoT items, 16.3% (Qwen-0.5B), 11.7% (Llama-3B), 8.3% (Qwen-3B) and 7.7%
+(Llama-1B) changed correctness between B=1 and B=64 (`results/summary_accuracy_flips.csv`). One
+exploratory comparison was nominally significant: Qwen-3B b64 vs b64_shuf, +0.94 pp, p=0.014,
+uncorrected and outside the pre-specified family. With 10 such shuffle tests this is consistent
+with chance.
+
+Representative example (Qwen2.5-1.5B, GSM8K, `results/examples.md`). The B=1 run writes "Initially,
+Hunter counted 50 cars." while the B=64 run writes "…50 cars **in the parking lot**." The two runs
+split at token 19, where the margin is one bf16 step (0.125). B=1 then reasons to the correct answer
+(35), and B=64 adds an extra step and answers 55.
+
+### 5.5 Model size (H5)
+
+| | 0.5B | 1.5B | 3B |
+|---|---|---|---|
+| Qwen2.5 bf16, CoT divergence B64 vs B64-shuf (n=700) | 72.7% | 40.0% | 63.7% |
+| Qwen2.5 AWQ, same | 19.9% | 8.7% | 13.9% |
+| Llama-3.2 bf16, same (1B / 3B) | 45.3% (1B) | – | 47.0% (3B) |
+
+There is no monotone size trend (Spearman ρ=−0.05, p=0.93 over the 5 bf16 models, CoT, B1 vs B64).
+Qwen2.5-1.5B is the most stable model in both dtypes, and 3B is less stable than 1.5B. Size effects
+are small and model-specific, while dtype effects are 5–15× larger. One confound: larger models also
+write longer or different CoTs. The length bins in the figure above show no consistent size ordering
+either.
+
+## 6. Limitations
+
+- **Scale.** The largest model is 3B. The 7B bf16 run never obtained a GPU slice on the shared
+  machine. Conclusions about ≥7B models are not tested here, though the mechanism (bf16 ties) is
+  size-agnostic.
+- **One engine, one GPU type.** vLLM 0.32 on A6000 (Ampere), eager mode, chunked prefill at 1,024
+  tokens. Other engines, CUDA graphs, FlashInfer/FA3 backends, tensor parallelism or Hopper GPUs may
+  have different invariance properties. The precise rates are engine-specific; the qualitative
+  findings (near-tie mechanism, precision ladder, length dependence) should transfer.
+- **Static batches.** We controlled batch size with static chunks. Production continuous batching
+  mixes prefill and decode across requests that arrive at random times, which likely makes batch
+  composition even more variable.
+- **Subsets.** The 3B bf16 models ran B=1 on 340 items and skipped B=4, so their CIs are wider.
+- **Small models / modest accuracy.** Base accuracies are 45–76%. Many items are borderline, which
+  inflates flip counts relative to a strong model on easy items.
+- **Answer extraction** is rule-based. Parse failures count as wrong (≤8% of MMLU-CoT outputs for
+  the 0.5B model); this affects both conditions equally, since the comparisons are paired.
+- **Margins** are computed from the logprobs vLLM returns (log-softmax of the model-dtype logits).
+  "Exact tie" means equal at that precision.
+
+## 7. Conclusions & Next Steps
+
+Greedy decoding in a standard bf16 vLLM deployment is **not** batch-invariant. Changing the batch size
+or batch-mates of a prompt changes the exact output of roughly a quarter to a third of prompts, and of
+half to three-quarters of long CoT generations. The cause is deterministic, batch-dependent rounding
+that flips the argmax at near-tied (often exactly tied) bf16 logits. After that, the continuation
+drifts freely. Mean benchmark accuracy is robust to this (|Δ| ≲ 1–2 pp, n.s.), but individual items
+are not: 3–5% of items, and up to 16% of CoT multiple-choice items, flip correctness. The
+"classification is more stable" impression is entirely an output-length effect. Model size, at
+least across 0.5–3B, matters much less than numeric precision: fp32 cuts divergence ~12× and fp16
+~5× relative to bf16.
+
+**Practical recommendations:**
+1. Treat a single bf16 evaluation run as one sample. Report ±1 pp batching noise, or fix the batch
+   schedule.
+2. For per-item reproducibility (regression tests, caching, audits), use batch-invariant kernels or
+   fp32 logits/accumulation. fp16 is a cheap partial fix where its range suffices.
+3. Don't interpret item-level differences between two configurations without a same-configuration
+   reshuffle baseline. Our b64_shuf control shows how large the "null" difference is.
+
+**Follow-ups:**
+1. 7B–70B models and Hopper GPUs.
+2. vLLM's batch-invariant mode (`VLLM_BATCH_INVARIANT`) as a positive control.
+3. fp32 `lm_head` only, which would test whether the final-layer logit precision alone drives most
+   ties.
+4. Continuous batching under realistic arrival processes.
+5. Reasoning models with 4k–32k-token traces, where the length dependence predicts near-certain
+   divergence.
+
+## References
+- He, H. and Thinking Machines Lab (2025). *Defeating Nondeterminism in LLM Inference.* Connectionism blog.
+- Yuan, J. et al. (2025). *Give Me FP32 or Give Me Death? Challenges and Solutions for Reproducible Reasoning.* arXiv:2506.09501.
+- Atil, B. et al. (2024). *LLM Stability: A detailed analysis with some surprises.* arXiv:2408.04667.
+- Kwon, W. et al. (2023). *Efficient Memory Management for LLM Serving with PagedAttention (vLLM).* SOSP.
+- Datasets: GSM8K (Cobbe et al., 2021), MMLU (Hendrycks et al., 2021), AG News (Zhang et al., 2015), SST-2 (Socher et al., 2013).
+- Models: Qwen2.5 (Qwen Team, 2024), Llama 3.2 (Meta, 2024).
+
+
+════════════════════════════════════════════════════════════════════════════════
+                            RESEARCH PLAN
+════════════════════════════════════════════════════════════════════════════════
+
+# Planning: Batch Size Effects on LLM Greedy Inference
+
+## Motivation & Novelty Assessment
+
+### Why This Research Matters
+Evaluation pipelines and production serving almost always batch requests, and practitioners routinely
+assume that `temperature=0` makes outputs a deterministic function of the prompt. If the batch a
+request lands in changes its greedy output, then benchmark numbers, regression tests, cached-answer
+systems, and "reproducible" evaluations become irreproducible in ways that are invisible to the user.
+How much this matters (how often, for which tasks, by how much accuracy) decides whether
+batch-invariant kernels are worth their throughput cost.
+
+### Gap in Existing Work
+No resource-finder output was available in this workspace (no `papers/`, `datasets/`, `code/`), so this
+review is from background knowledge. The problem is widely known: Thinking Machines Lab's "Defeating
+Nondeterminism in LLM Inference" (He et al., 2025) traces it to batch-dependent reduction orders in
+matmul, RMSNorm and attention kernels and proposes batch-invariant kernels. Yuan et al. (2025),
+"Give Me FP32 or Give Me Death?", report accuracy swings of up to several points for reasoning models
+across GPU count, batch size and dtype. Atil et al. (2024) document non-determinism of
+"deterministic" API settings. What is missing is a **controlled, per-prompt** decomposition on open
+models that (a) separates batch size from batch *composition* and from run-to-run noise, (b) separates
+task type from output length (both vary together in most studies), (c) explains *where* in a sequence a
+divergence starts (logit near-ties), and (d) compares model sizes on a single numeric format.
+
+### Our Novel Contribution
+We run byte-identical prompts through a single vLLM engine per model under static batch sizes
+B ∈ {1, 4, 16, 64}, plus a same-B reshuffle and same-schedule repeats. We measure exact-match rate,
+first-divergence position, the reference model's top-1/top-2 logit margin at the divergence token,
+and correctness flips, on 5 tasks that cross {math, non-math reasoning, classification} with
+{long CoT, short answer}, and on 6 models (Qwen2.5 0.5B/1.5B/3B/7B, Llama-3.2 1B/3B) plus an
+fp32 control.
+
+### Experiment Justification
+- **Exp 1 (batch-size sweep)**: directly tests the >95%-exact-match claim and the dose-response
+  with B.
+- **Exp 2 (controls: b64 repeat, b1 repeat, b64 reshuffle)**: without these we can't tell batch-size
+  effects from general run-to-run nondeterminism or from which prompts share a batch.
+- **Exp 3 (task × length design)**: MMLU appears both with CoT (long) and as a direct letter answer
+  (short), so the "math vs classification" claim can be separated from output length. Survival
+  and hazard analysis of the first-divergence position normalises for length.
+- **Exp 4 (accuracy impact)**: tests "<1% mean accuracy difference but individual flips", with paired
+  tests.
+- **Exp 5 (model size + fp32 control)**: tests "smaller models diverge more". The fp32 run of the
+  0.5B model tests the floating-point explanation causally: higher precision should almost remove
+  divergence.
+
+## Research Question
+Under greedy decoding, does the static batch size used at inference change a model's outputs? How
+often, where in the sequence, for which tasks and model sizes, and with what effect on accuracy?
+
+## Hypothesis Decomposition
+- H1: ≥95% of prompts give token-identical outputs across batch sizes (only 3–5% diverge).
+- H2: divergence probability rises with output length.
+- H3: divergence is more common for math/reasoning than for classification, *beyond* the length effect.
+- H4: mean accuracy differs by <1 pp across batch sizes, but individual items flip correct↔incorrect.
+- H5: smaller models diverge more than larger ones.
+- Mechanism (H0-mech): divergences start at tokens where the reference top-1/top-2 margin is ~0, and
+  fp32 inference sharply reduces them.
+
+## Proposed Methodology
+
+### Approach
+vLLM 0.32 (V1 engine, eager mode, chunked prefill, prefix caching disabled, max_num_seqs=64), with
+one engine per model. Batch size is controlled by submitting prompts in static chunks of B
+(`llm.generate(chunk)`). Prompts are in a fixed, task-mixed random order (as a serving queue would see
+them). All sampling is greedy (temperature 0), with top-2 logprobs recorded per token.
+
+### Experimental Steps
+1. Build 1,700 items: GSM8K 400, MMLU-CoT 300, MMLU-direct 400, AG News 300, SST-2 300.
+2. For each model, run conditions b64, b64_rep, b64_shuf, b16, b4, b1, b1_rep (b1_rep on every 5th item).
+3. Score accuracy per task (number / letter / label extraction).
+4. Pairwise exact-match, first divergence index, margin at divergence, answer-flip analysis.
+
+### Baselines
+Reference = b1 (sequential). Noise floors = b1 vs b1_rep and b64 vs b64_rep.
+
+### Evaluation Metrics
+Exact token-sequence match rate, first-divergence token index, final-answer agreement, task accuracy,
+per-token divergence hazard, and the top-1/top-2 logprob margin.
+
+### Statistical Analysis Plan
+Wilson 95% CIs for proportions. McNemar exact tests for paired accuracy (b1 vs bX). Cochran's Q
+across all B. Logistic regression of divergence on log(output length) + task type + model. Bootstrap
+CIs over items for accuracy differences. α = 0.05 with Holm correction across the model × B family.
+
+## Expected Outcomes
+H1 is supported if the exact-match rate is ≥95%. The smoke test (0.5B, 61 items, b64 vs b1) already
+showed only ~67% exact match, so H1 is likely refuted for long CoT outputs.
+
+## Timeline and Milestones
+Setup + smoke test: 30 min (done). Generation: ~2–4 h, depending on shared-GPU availability (queue).
+Analysis: 1 h. Report: 45 min.
+
+## Potential Challenges
+- Shared GPUs (≤5 GB free at times): use a queue with in-process memory holding; the 7B model may not
+  get a slice, in which case b1 runs on a subset (B1_SUB) or is dropped and documented.
+- b1 is slow (sequential decode): ~1 h for small models.
+- Other tenants' load does not change our kernels' reduction order, but our static chunks mean the
+  batch composition is controlled.
+
+## Success Criteria
+All small models complete all conditions; at least one ≥3B model completes; every hypothesis component
+gets a quantified verdict with CIs.
+
+## Deviations During Execution (added after the runs)
+- The Qwen2.5-7B bf16 run never obtained a ≥19 GB GPU slice on the shared machine and was dropped.
+  Replacements: Qwen2.5 {0.5,1.5,3}B-AWQ (fp16 activations) and a Qwen2.5-0.5B **fp16** run, added to
+  separate activation precision from quantisation after AWQ showed much lower divergence.
+- Qwen2.5-3B and Llama-3.2-3B (bf16): b4 dropped and b1 run on the 340-item subset (B1_SUB=1) for
+  time reasons. b1_rep was skipped for Qwen2.5-3B and Qwen2.5-0.5B-AWQ.
+- Holm family = 28 tests (model × B vs B=1).
+
+
+════════════════════════════════════════════════════════════════════════════════
+                          LITERATURE REVIEW
+════════════════════════════════════════════════════════════════════════════════
+
+No literature_review.md found
+
+════════════════════════════════════════════════════════════════════════════════
+                          PAPER REQUIREMENTS
+════════════════════════════════════════════════════════════════════════════════
+
+Generate a complete academic paper with the following structure:
+
+1. TITLE
+   - Clear, specific, informative
+   - Should convey main finding or contribution
+
+2. AUTHOR
+   - Use this exact author line in the \author{} block: NeuriCo
+
+3. ABSTRACT (150-250 words)
+   - Problem statement
+   - Approach
+   - Key results
+   - Significance
+
+4. INTRODUCTION
+   - Research problem and motivation
+   - Gap in existing work
+   - Our contribution (be specific)
+   - Paper organization
+
+5. RELATED WORK
+   - Organized by theme/approach
+   - Position our work relative to prior work
+   - Cite papers from literature review
+
+6. METHODOLOGY
+   - Clear description of approach
+   - Experimental setup
+   - Datasets used
+   - Evaluation metrics
+   - Baselines
+
+7. RESULTS
+   - Present results with tables and figures
+   - Statistical analysis
+   - Comparison to baselines
+   - Ablation studies (if applicable)
+
+8. DISCUSSION
+   - Interpretation of results
+   - Limitations
+   - Broader implications
+
+9. CONCLUSION
+   - Summary of contributions
+   - Key findings
+   - Future work
+
+10. REFERENCES
+   - BibTeX format
+   - All cited papers
+
+════════════════════════════════════════════════════════════════════════════════
+                          OUTPUT FORMAT
+════════════════════════════════════════════════════════════════════════════════
+
+Create a MODULAR LaTeX project with the following directory structure:
+
+paper_draft/
+├── main.tex              # Main file that imports all sections
+├── references.bib        # BibTeX references
+├── sections/
+│   ├── abstract.tex      # Abstract content
+│   ├── introduction.tex  # Introduction section
+│   ├── related_work.tex  # Related work section
+│   ├── methodology.tex   # Methodology section
+│   ├── results.tex       # Results section
+│   ├── discussion.tex    # Discussion section
+│   └── conclusion.tex    # Conclusion section
+├── figures/              # Directory for any generated figures
+├── tables/               # Directory for complex standalone tables
+└── appendix/             # Directory for appendix sections (if needed)
+
+INSTRUCTIONS:
+1. First, create the directory structure above (mkdir -p paper_draft/sections paper_draft/figures paper_draft/tables paper_draft/appendix)
+2. Write main.tex using the EXACT preamble for NEURIPS:
+
+   \documentclass{article}
+   \usepackage[final]{neurips_2025}  % NEURIPS style (neurips_2025.sty is in paper_draft/)
+   \usepackage[hidelinks]{hyperref}  % REQUIRED: clickable links
+   \usepackage{booktabs}  % REQUIRED: professional tables
+   \usepackage{graphicx}
+   \usepackage{amsmath,amssymb}
+
+   % Import command files
+   \input{commands/math}
+   \input{commands/general}
+   \input{commands/macros}
+
+   % Use this bibliography style:
+   \bibliographystyle{plainnat}
+
+   \author{NeuriCo}
+
+   - Use \input{sections/...} to include each section
+   - Use \bibliography{references} for references
+3. Write each section file with COMPLETE content (no placeholders)
+4. Each section file should include its \section{} command
+5. Write references.bib with all citations in BibTeX format
+6. After writing all files, compile the paper:
+   cd paper_draft && pdflatex -interaction=nonstopmode main.tex && bibtex main && pdflatex -interaction=nonstopmode main.tex && pdflatex -interaction=nonstopmode main.tex
+
+This modular structure allows humans to easily:
+- Edit individual sections without navigating a large file
+- Track changes per section
+- Reuse sections across different paper versions
+
+════════════════════════════════════════════════════════════════════════════════
+                          QUALITY REQUIREMENTS
+════════════════════════════════════════════════════════════════════════════════
+
+- Academic tone throughout
+- All claims must be supported by data from the experiment report
+- Proper citations using \cite{} commands
+- Clear figures and tables with proper captions
+- NO placeholder text - every section must have real content
+- The paper MUST compile without errors
+- If compilation fails, debug and fix the LaTeX errors
+
+════════════════════════════════════════════════════════════════════════════════
+                          LAB WRITING STYLE
+════════════════════════════════════════════════════════════════════════════════
+
+Follow these lab-specific conventions to match our paper style:
+
+1. LANGUAGE STYLE:
+   - Use active voice: "We propose", "We examine", "We focus on"
+   - Be direct and confident: "Our main question is...", "We hypothesize that..."
+   - State things clearly and simply - prefer plain language over jargon
+   - Use bold questions as paragraph organizers: {\bf what is X?}
+   - Include specific quantitative claims: "8.97% over baseline"
+   - Avoid fancy wording: "utilize" → "use", "facilitate" → "help"
+
+2. INTRODUCTION STRUCTURE:
+   - Engaging hook (get to the point quickly)
+   - Problem importance
+   - Gap identification
+   - Your approach with method figure reference
+   - Quantitative preview of results
+   - Contribution bullets (3-4 items, action verbs)
+
+3. CONTRIBUTION LISTS:
+   \begin{itemize}[leftmargin=*,itemsep=0pt,topsep=0pt]
+       \item We propose...
+       \item We conduct...
+       \item We complement...
+   \end{itemize}
+
+4. MODULAR COMMANDS STRUCTURE:
+   Command templates are pre-copied to paper_draft/commands/:
+   - math.tex: Math notation macros
+   - general.tex: Formatting macros
+   - macros.tex: Project-specific term definitions (customize this for your paper)
+
+   In main.tex, include:
+   \input{commands/math}
+   \input{commands/general}
+   \input{commands/macros}
+
+5. REFERENCE CONVENTIONS:
+   Use reference macros from math.tex:
+   - \figref{fig:name} for "figure 1" (lowercase, in-sentence)
+   - \Figref{fig:name} for "Figure 1" (capitalized, start of sentence)
+   - \secref{sec:name} for "section 2"
+
+6. TEXT FORMATTING:
+   - Use \para{Header text} for bold paragraph headers
+   - Define method/dataset names with \textsc and \xspace:
+     \newcommand{\methodname}{\textsc{MethodName}\xspace}
+
+7. TABLE FORMATTING:
+   - Use booktabs package (no vertical lines)
+   - Use \resizebox{\textwidth}{!}{...} for wide tables
+   - Use @{} to remove padding at table edges
+   - Use \cmidrule(lr){x-y} for sub-headers
+   - Use \textsc{} for dataset/method names in headers
+   - Bold best results with {\bf ...}
+
+8. FIGURE FORMATTING:
+   - Use 0.32\textwidth for 3-column subfigures
+   - Use 0.95\linewidth for full-width figures
+   - Use \input{figures/legend} for shared legends
+   - Write self-contained captions explaining key observations
+
+9. RESULTS PRESENTATION:
+   - Define \increase and \decrease for colored arrows (green up, red down)
+   - Bold best results in tables
+   - Report confidence intervals when available
+
+10. ALGORITHM STYLING:
+    - Use algpseudocode with [noend]
+    - Use \triangleright for comments
+
+11. HYPERLINKS (REQUIRED):
+    - Always use \usepackage[hidelinks]{hyperref} or with colored links
+    - All citations, section refs, figure refs, table refs must be clickable
+    - This is essential for reader navigation
+
+════════════════════════════════════════════════════════════════════════════════
+                          WORKFLOW: REVIEW AND REFLECT
+════════════════════════════════════════════════════════════════════════════════
+
+Before calling finish, you MUST complete these review steps:
+
+1. REVIEW RESOURCES (at the start):
+   - Read .claude/skills/paper-writer/SKILL.md for detailed guidance
+   - Study templates/paper_writing/lab_style_guide.md for style conventions
+   - Browse paper_examples/ for formatting and language patterns
+
+2. SELF-REFLECTION (before finishing):
+   After writing all sections, review your work against these criteria:
+
+   LANGUAGE CHECK:
+   - [ ] Is the writing clear and jargon-free?
+   - [ ] Are claims specific with quantitative support?
+   - [ ] Is active voice used throughout?
+
+   FORMATTING CHECK:
+   - [ ] Does main.tex include \input{commands/math}, \input{commands/general}, \input{commands/macros}?
+   - [ ] Is hyperref package included for clickable references?
+   - [ ] Do tables use booktabs (no vertical lines)?
+   - [ ] Are best results bolded in tables?
+   - [ ] Are figures/tables properly captioned?
+
+   STRUCTURE CHECK:
+   - [ ] Does introduction follow: hook → importance → gap → approach → preview → contributions?
+   - [ ] Are contribution bullets specific with action verbs?
+   - [ ] Does the paper compile without errors?
+
+3. FIX ISSUES:
+   - Address any issues found in the self-reflection
+   - Re-compile and verify the PDF looks correct
+
+Only after completing this review should you consider the paper finished.

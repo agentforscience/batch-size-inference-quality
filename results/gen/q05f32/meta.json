@@ -1,0 +1,8 @@
+{
+ "model": "Qwen/Qwen2.5-0.5B-Instruct",
+ "tag": "q05f32",
+ "dtype": "float32",
+ "mem_gb": 5.0,
+ "gpu": "2",
+ "max_num_seqs": 64
+}

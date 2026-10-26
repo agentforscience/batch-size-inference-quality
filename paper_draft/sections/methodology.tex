@@ -1,0 +1,82 @@
+\section{Method}
+\label{sec:method}
+
+\subsection{Problem formulation}
+Let $x$ be a prompt and $\gS$ a \emph{schedule}, \ie an assignment of prompts to batches together with the order of batches. Greedy decoding produces tokens $y_t = \argmax_v \ell_t(v \mid x, y_{<t}; \gS)$, where $\ell_t$ are the logits computed by the engine. If the engine were batch-invariant, $\ell_t$, and therefore the output $\vy(x;\gS)$, would not depend on $\gS$. For two schedules $\gS_a$ and $\gS_b$ we define:
+\begin{itemize}[leftmargin=*,itemsep=0pt,topsep=0pt]
+    \item \newterm{Divergence}: $\vy(x;\gS_a) \neq \vy(x;\gS_b)$ as token-id sequences.
+    \item \newterm{First divergence index}: the smallest $t$ with $y_t(x;\gS_a) \neq y_t(x;\gS_b)$.
+    \item \newterm{Margin at divergence}: $m = \log p^{(1)}_t - \log p^{(2)}_t$, the gap between the top-1 and top-2 log-probabilities at that index in the reference run $\gS_a$ (always $B=1$ when comparing against the sequential run).
+    \item \newterm{Answer change} and \newterm{correctness flip}: whether the extracted answer, or its correctness, differs.
+\end{itemize}
+
+\subsection{Models}
+We use ten configurations, all served locally (\tabref{tab:models}). We use open models rather than APIs because our question is about the inference engine, which we must control. Five bf16 models span two families and 0.5B--3B parameters: \qwen-\{0.5B, 1.5B, 3B\}-Instruct~\citep{qwen2024qwen25} and \llama-\{1B, 3B\}-Instruct~\citep{meta2024llama32}. To test the floating-point explanation directly, we also run \qwen-0.5B with the same weights cast to fp16 and fp32, and AWQ checkpoints~\citep{lin2024awq} of the three \qwen sizes (int4 weights, fp16 activations).
+
+\begin{table}[t]
+    \centering
+    \small
+    \caption{Model configurations. All configurations use the same engine settings. The fp16 and fp32 runs reuse the bf16 weights of \qwen-0.5B, so any difference between them is due to numeric precision alone.}
+    \label{tab:models}
+    \begin{tabular}{@{}lll@{}}
+        \toprule
+        \textbf{Model} & \textbf{Sizes} & \textbf{Weights / activations} \\
+        \midrule
+        \qwen-Instruct & 0.5B, 1.5B, 3B & bf16 / bf16 \\
+        \llama-Instruct & 1B, 3B & bf16 / bf16 \\
+        \qwen-0.5B-Instruct & 0.5B & fp16 / fp16 (cast) \\
+        \qwen-0.5B-Instruct & 0.5B & fp32 / fp32 (cast) \\
+        \qwen-Instruct-AWQ & 0.5B, 1.5B, 3B & int4 / fp16 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsection{Tasks}
+We build 1,700 items from five tasks (\tabref{tab:tasks}, seed 42). Two tasks produce long CoT outputs and three produce a short label. MMLU appears twice, with disjoint questions: once with CoT and once with a direct letter answer. This lets us compare the same kind of question at two output lengths, so that we can tell the effect of the task apart from the effect of length. All prompts use the model's chat template and a task-specific system prompt. We extract answers with rules (``The answer is N/X'' for CoT, label matching for short tasks), and count parse failures as wrong.
+
+\begin{table}[t]
+    \centering
+    \small
+    \caption{Tasks. ``Long'' tasks ask for step-by-step reasoning that ends in ``The answer is \ldots''. ``Short'' tasks ask for a single label.}
+    \label{tab:tasks}
+    \begin{tabular}{@{}llrll@{}}
+        \toprule
+        \textbf{Task} & \textbf{Source split} & $n$ & \textbf{Output} & \textbf{Max tokens} \\
+        \midrule
+        \gsm~\citep{cobbe2021gsm8k} & test & 400 & CoT + number & 512 \\
+        \mmlucot~\citep{hendrycks2021mmlu} & test & 300 & CoT + letter & 512 \\
+        \midrule
+        \mmludirect~\citep{hendrycks2021mmlu} & test (disjoint) & 400 & letter & 8 \\
+        \agnews~\citep{zhang2015agnews} & test & 300 & topic label & 8 \\
+        \sst~\citep{socher2013sst} & validation & 300 & positive/negative & 8 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsection{Conditions}
+We place all prompts in a fixed random order that mixes tasks (order A, seed 0), as a serving queue would see them. For each condition we split this order into consecutive static chunks of size $B$ and call \texttt{llm.generate} on each chunk, so that at most $B$ sequences are ever co-scheduled. \Tabref{tab:conditions} lists the conditions. The two repeat conditions measure the run-to-run noise floor. The reshuffle condition keeps the batch size but changes which prompts share a batch.
+
+\begin{table}[t]
+    \centering
+    \small
+    \caption{Experimental conditions. All conditions for a model run in the same engine instance. The sequential run \bone is the reference.}
+    \label{tab:conditions}
+    \begin{tabular}{@{}llll@{}}
+        \toprule
+        \textbf{Condition} & $B$ & \textbf{Order} & \textbf{Purpose} \\
+        \midrule
+        \bone & 1 & A & sequential reference \\
+        \cond{b4}, \cond{b16}, \bsf & 4, 16, 64 & A & batch-size sweep \\
+        \brep & 64 & A & identical schedule again (noise floor) \\
+        \bshuf & 64 & B (seed 1) & same size, different batch-mates \\
+        \cond{b1\_rep} & 1 & A, every 5th item ($n=340$) & determinism of the reference \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\para{Engine settings.} We use \vllm 0.32.0 (V1 engine, in-process) with eager execution, chunked prefill (\texttt{max\_num\_batched\_tokens}=1024), \texttt{max\_num\_seqs}=64, prefix caching disabled, a maximum model length of 2,048, temperature 0, seed 1234, and top-2 log-probabilities returned for every generated token. We disable prefix caching so that every request computes its own prefill. Shared-GPU time limits forced two reductions for the two 3B bf16 models: \bone and \cond{b1\_rep} ran on the 340-item subset (every 5th item), and \cond{b4} was dropped. \cond{b1\_rep} was also skipped for \qwen-3B and \qwen-0.5B-AWQ.
+
+\subsection{Statistics}
+We report Wilson 95\% confidence intervals for divergence rates. For accuracy we use paired comparisons: exact McNemar tests~\citep{mcnemar1947} with Holm correction~\citep{holm1979} over the 28 primary tests (model $\times$ $B\in\{4,16,64\}$ against $B=1$), and 2,000-sample paired bootstrap 95\% CIs on the accuracy difference. To separate length from task, we fit a logistic regression of divergence on $\log(\text{output length})$, task type and model. We also compute a per-token hazard, the number of divergences per 1,000 identical tokens at risk, which normalizes for length. For model size we use Spearman's $\rho$ over the five bf16 models.
+
+\para{Hardware.} We run on 4$\times$ RTX A6000 (48\,GB, Ampere) GPUs shared with other users, with each job confined to a 3.4--8.8\,GB memory slice. Software: Python 3.12, \vllm 0.32.0, PyTorch 2.13 (CUDA 13.0), transformers 5.19. Generation took about 19 GPU-hours in total (about 10.5k generations per configuration).

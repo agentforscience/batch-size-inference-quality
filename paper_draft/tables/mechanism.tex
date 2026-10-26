@@ -1,0 +1,23 @@
+\begin{table}[t]
+    \centering
+    \small
+    \caption{Logit margin at the first divergence token (\bone vs \bsf). ``Tie'' means the top-1 and top-2 log-probabilities in the \bone run are exactly equal at the model's precision. Ties make up only 1--1.5\% of all bf16 tokens but 43--47\% of first-divergence tokens. Margins are in nats.}
+    \label{tab:mechanism}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{@{}lcccc@{}}
+        \toprule
+        \textbf{Model (dtype)} & \textbf{\% all tokens tied} & \textbf{\% divergences tied} & \textbf{\% divergences $m\le0.125$} & \textbf{Median $m$} \\
+        \midrule
+        \qwen-0.5B (bf16) & 1.02 & 43.2 & 93.9 & 0.125 \\
+        \qwen-1.5B (bf16) & 0.93 & 46.9 & 96.2 & 0.125 \\
+        \qwen-3B (bf16)   & 1.38 & 43.4 & 91.2 & 0.125 \\
+        \llama-1B (bf16)  & 1.55 & 45.2 & 97.8 & 0.125 \\
+        \llama-3B (bf16)  & 1.52 & 46.8 & 100  & 0.125 \\
+        \midrule
+        \qwen-0.5B (fp16) & 0.14 & 46.8 & 100 & 0.016 \\
+        \qwen-0.5B (fp32) & 0.00 & 0    & 100 & 0.0014 \\
+        \qwen-AWQ (0.5/1.5/3B) & 0.12--0.14 & 45--60 & 100 & 0.000--0.016 \\
+        \bottomrule
+    \end{tabular}
+    }
+\end{table}

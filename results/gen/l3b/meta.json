@@ -1,0 +1,8 @@
+{
+ "model": "unsloth/Llama-3.2-3B-Instruct",
+ "tag": "l3b",
+ "dtype": "bfloat16",
+ "mem_gb": 7.5,
+ "gpu": "2",
+ "max_num_seqs": 64
+}

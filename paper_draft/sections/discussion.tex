@@ -1,0 +1,44 @@
+\section{Discussion}
+\label{sec:discussion}
+
+\begin{table}[t]
+    \centering
+    \small
+    \caption{Summary of hypothesis verdicts.}
+    \label{tab:verdicts}
+    \begin{tabular}{@{}lp{5.2cm}p{6.2cm}@{}}
+        \toprule
+        \textbf{ID} & \textbf{Claim} & \textbf{Verdict} \\
+        \midrule
+        H1 & $\ge$95\% identical; only 3--5\% diverge & {\bf Refuted} for bf16 (66--80\% identical overall, 24--53\% on CoT); holds for fp32 (97\%) and roughly for fp16/AWQ (92--97\%) \\
+        H1b & Cause is floating-point effects in batched kernels & {\bf Supported}: deterministic batch-dependent rounding acting at near-tied logits \\
+        H2 & Divergence grows with length & {\bf Supported} (log-length coefficient $+1.14$, $p\approx10^{-78}$) \\
+        H3 & Math/reasoning diverges more than classification & {\bf Refuted as stated}: task n.s.\ given length ($p=0.58$); \gsm diverges \emph{less} than \mmlucot (OR 0.41) \\
+        H4 & Mean accuracy $<$1\pp; items flip & {\bf Supported}: mean $|\Delta|$ = 0.8\pp, none significant; 2.9--5.3\% of items flip \\
+        H5 & Smaller models diverge more & {\bf Not supported} ($\rho=-0.05$, $p=0.93$) \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+{\bf What does this mean for evaluation?} A bf16 benchmark score is one sample from a distribution over batch schedules. In our runs the spread is about $\pm$1\pp for mean accuracy and up to 1.8\pp for a single comparison. That is the same size as many reported gains between methods or checkpoints. Two evaluations that differ only in harness batch size, server load or request order can disagree on 3--5\% of items, and on up to 16\% of CoT multiple-choice items. This matters most where people compare items rather than averages: regression tests that check outputs exactly, caches keyed on the prompt, audits that replay a decision, and paired model comparisons. Before interpreting item-level differences between two configurations, one should measure a same-configuration baseline. Our \bshuf control shows how large this null difference can be.
+
+{\bf Why does the effect not scale with $B$?} The near-tie mechanism explains the absence of a dose-response. A batch change does not add error that grows with $B$. It changes the reduction order, which moves logits by about one rounding step. Any such change flips the argmax at the same set of tied positions, whether $B$ goes from 1 to 4 or to 64. This is also why reshuffling batch-mates is almost as disruptive as changing $B$, and why identical schedules agree exactly.
+
+{\bf Why does length dominate task?} Per token, the chance of a flip is a few per thousand, set by how often the model sees a near-tie. Over hundreds of CoT tokens these chances add up, while a one-token label has only one chance. Short multiple-choice answers in fact have a \emph{higher} per-token hazard, because the model is often unsure between two letters. Claims that ``reasoning is fragile'' under batching are therefore mostly claims about long outputs.
+
+{\bf What can practitioners do?} Three options follow from our results. (1) Fix the batch schedule and report it, accepting that results are reproducible only under that schedule. (2) Use batch-invariant kernels~\citep{he2025nondeterminism}, which remove the dependence at a throughput cost. (3) Raise precision: on identical weights, fp32 cuts divergence about 12$\times$ and fp16 about 5$\times$ relative to bf16. fp16 is a cheap partial fix where its range suffices.
+
+\subsection{Limitations}
+\label{sec:limitations}
+
+\para{Scale.} Our largest model has 3B parameters. A planned \qwen-7B bf16 run never obtained the required $\ge$19\,GB slice on the shared GPUs. The tie mechanism does not depend on model size, but we have not measured rates for models of 7B and above.
+
+\para{One engine, one GPU type.} All runs use \vllm 0.32 on Ampere GPUs in eager mode with chunked prefill at 1,024 tokens. CUDA graphs, other attention backends, tensor parallelism, other engines or Hopper GPUs may differ in invariance. We expect exact rates to be engine-specific, while the qualitative findings (near-tie mechanism, precision ladder, length dependence) should transfer.
+
+\para{Static batches.} We control batch size with static chunks. Production continuous batching mixes prefill and decode of requests arriving at random times, which probably makes composition even more variable than in our setting.
+
+\para{Subsets and model strength.} The two 3B bf16 models ran $B=1$ on 340 items and skipped $B=4$, so their intervals are wider. Base accuracies are 45--76\%, so many items are borderline; a strong model on easy items would likely flip fewer.
+
+\para{Measurement.} Answer extraction is rule-based, and parse failures count as wrong (up to 8\% of \mmlucot outputs for \qwen-0.5B). Because comparisons are paired, this affects both conditions equally. Margins come from the log-probabilities returned by \vllm, so ``exact tie'' means equal at that precision.
+
+\para{Broader impact.} This work concerns the reliability of LLM evaluation and serving. Its main risk is misreading: a non-significant mean change could be read as ``batching is harmless,'' while item-level behavior, which matters for audits and user-facing decisions, is not stable. We report both levels to avoid this.

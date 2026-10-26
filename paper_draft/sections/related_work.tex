@@ -1,0 +1,11 @@
+\section{Related Work}
+\label{sec:related}
+
+\para{Nondeterminism in LLM inference.}
+\citet{he2025nondeterminism} attribute LLM inference nondeterminism mainly to kernels that are not batch-invariant. Matrix multiplication, RMSNorm and attention choose reduction strategies or tilings based on the batch shape, so the numerics of a request depend on its co-scheduled requests. They also release batch-invariant kernels for \vllm. \citet{yuan2025fp32} report that GPU count, batch size and dtype change both the greedy outputs and the accuracy of reasoning models, and that fp32 largely restores reproducibility. \citet{atil2024stability} document output variation from commercial APIs under nominally deterministic settings. Building on these works, we provide a controlled per-prompt decomposition. We separate batch size from batch composition and from repeat noise, and we locate the exact token and logit margin where each divergence begins.
+
+\para{Floating-point formats in deep learning.}
+Reduced-precision formats are standard for training and inference~\citep{micikevicius2018mixed}. bfloat16 keeps the fp32 exponent range but has only 8 bits of significand~\citep{kalamkar2019bf16}, so nearby values collapse onto a coarse grid. Weight-only quantization such as AWQ~\citep{lin2024awq} stores weights in 4 bits but usually computes activations in fp16. Unlike prior work that compares formats by end-task accuracy, we compare them by how often the argmax flips under batching, and we show that activation precision, not weight quantization, sets the divergence rate.
+
+\para{Reproducibility of LLM evaluation.}
+Benchmarks such as \gsm~\citep{cobbe2021gsm8k} and MMLU~\citep{hendrycks2021mmlu} are usually reported from a single greedy run, often with CoT prompting~\citep{wei2022cot}. Unlike work that studies variance across prompts or sampling seeds, we isolate a source of variance that remains even under greedy decoding with a fixed prompt. We estimate its size at both the benchmark level and the item level.

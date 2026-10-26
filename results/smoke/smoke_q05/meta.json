@@ -1,0 +1,8 @@
+{
+ "model": "Qwen/Qwen2.5-0.5B-Instruct",
+ "tag": "smoke_q05",
+ "dtype": "auto",
+ "mem_gb": 4.3,
+ "gpu": "2",
+ "max_num_seqs": 64
+}

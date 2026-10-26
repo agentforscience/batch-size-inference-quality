@@ -1,0 +1,25 @@
+\begin{table}[t]
+    \centering
+    \caption{Accuracy under sequential (\bone) and batched (\bsf) decoding. $\Delta$ is \bsf minus \bone with a paired bootstrap 95\% CI. Flips count items that go right$\to$wrong (R$\to$W) or wrong$\to$right (W$\to$R). $p$ is the exact McNemar test, with the Holm-adjusted value over 28 tests in parentheses. No difference is significant, but bf16 models flip 3--5\% of items. 3B bf16 models use the 340-item subset. Lowest flip rate in \textbf{bold}.}
+    \label{tab:accuracy}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{@{}llccccccc@{}}
+        \toprule
+        \textbf{Model} & \textbf{dtype} & \textbf{Acc \bone} & \textbf{Acc \bsf} & $\Delta$ (pp) [95\% CI] & \textbf{R$\to$W} & \textbf{W$\to$R} & \textbf{Flip \%} & $p$ (Holm) \\
+        \midrule
+        \qwen-0.5B & bf16 & 56.18 & 56.88 & $+0.71$ [$-0.41$, $+1.76$] & 39 & 51 & 5.3 & 0.25 (1.0) \\
+        \qwen-1.5B & bf16 & 70.88 & 70.59 & $-0.29$ [$-1.06$, $+0.59$] & 29 & 24 & 3.1 & 0.58 (1.0) \\
+        \qwen-3B   & bf16 & 72.94 & 71.76 & $-1.18$ [$-2.94$, $+0.59$] & 7 & 3 & 2.9 & 0.34 (1.0) \\
+        \llama-1B  & bf16 & 50.12 & 49.94 & $-0.18$ [$-1.12$, $+0.76$] & 35 & 32 & 3.9 & 0.81 (1.0) \\
+        \llama-3B  & bf16 & 67.65 & 69.41 & $+1.76$ [$-0.29$, $+4.12$] & 4 & 10 & 4.1 & 0.18 (1.0) \\
+        \midrule
+        \qwen-0.5B & fp16 & 56.82 & 56.82 & $\phantom{+}0.00$ [$-0.41$, $+0.47$] & 7 & 7 & 0.8 & 1.0 (1.0) \\
+        \qwen-0.5B & fp32 & 56.35 & 56.12 & $-0.24$ [$-0.65$, $+0.18$] & 8 & 4 & 0.7 & 0.39 (1.0) \\
+        \midrule
+        \qwen-0.5B & AWQ & 45.00 & 45.24 & $+0.24$ [$-0.18$, $+0.65$] & 4 & 8 & 0.7 & 0.39 (1.0) \\
+        \qwen-1.5B & AWQ & 67.47 & 67.35 & $-0.12$ [$-0.47$, $+0.18$] & 5 & 3 & 0.5 & 0.73 (1.0) \\
+        \qwen-3B   & AWQ & 74.53 & 74.59 & $+0.06$ [$-0.18$, $+0.29$] & 2 & 3 & \textbf{0.3} & 1.0 (1.0) \\
+        \bottomrule
+    \end{tabular}
+    }
+\end{table}
